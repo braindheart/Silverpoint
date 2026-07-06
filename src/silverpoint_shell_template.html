@@ -1,0 +1,1524 @@
+<!doctype html>
+<!--
+  Silverpoint Hatch — browser edition
+  SPDX-License-Identifier: AGPL-3.0-only
+  Copyright (C) 2026 Brian Hart — thebrianhart.com · uneditioned.com
+
+  This program is free software: you can redistribute it and/or modify it
+  under the terms of the GNU Affero General Public License as published by
+  the Free Software Foundation, version 3. See the LICENSE file distributed
+  alongside this file, or https://www.gnu.org/licenses/agpl-3.0.html
+
+  Single-file, zero-dependency. Everything runs in YOUR browser — models
+  never leave your machine. Drawings you make with this tool are yours.
+
+  Architecture:
+    * the algorithm (silverpoint core, validated byte-identical against the
+      Blender addon pipeline) runs in a Web Worker, embedded below
+    * the worker caches mesh + BVH + AO between runs, so re-lighting and
+      re-slicing take ~1-2 s; AO recomputes only when its settings change
+    * the page is UI only: controls in, SVG out
+
+  DESIGN NOTE: all visual decisions live in the :root token block at the top
+  of the stylesheet. Restyle freely — nothing below the tokens is precious.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Silverpoint Hatch - Uneditioned</title>
+<style>
+/* ============================= design tokens =============================
+   The one place to restyle the whole tool. */
+:root {
+  /* light room, white sheet, muted CMYK voice */
+  --paper:        #ffffff;   /* the sheet the drawing sits on            */
+  --room:         #ececec;   /* the wall behind the sheet                */
+  --panel:        #f7f7f7;   /* control column background                */
+  --line:         #d8d8d8;   /* hairline rules                           */
+  --k:            #2b2b2b;   /* key (text) black                         */
+  --c:            #38788f;   /* muted cyan — legends, status, links      */
+  --m:            #a34d78;   /* muted magenta — actions, focus, current  */
+  --y:            #b3922f;   /* muted yellow — small ready/hint accents  */
+  --ink:          var(--k);
+  --ink-soft:     #7a7a7a;
+  --accent:       var(--m);
+  --mono:         ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --sans:         system-ui, -apple-system, "Segoe UI", sans-serif;
+  --ctrl-h:       26px;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  font: 13px/1.45 var(--sans); color: var(--ink);
+  background: var(--room);
+  display: grid; grid-template-rows: auto 1fr;
+}
+
+/* ============================== header =================================== */
+header {
+  display: flex; align-items: baseline; gap: 14px;
+  padding: 10px 16px; background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+header h1 { font: 600 15px var(--sans); margin: 0; letter-spacing: .02em; }
+header .status { font: 12px var(--mono); color: var(--c); }
+header .spacer { flex: 1; }
+header a { color: var(--ink-soft); font-size: 11px; text-decoration: none; }
+
+/* ============================== layout =================================== */
+main { display: grid; grid-template-columns: 300px 1fr; min-height: 0; }
+@media (max-width: 760px) { main { grid-template-columns: 1fr; } }
+
+/* controls column */
+#controls {
+  background: var(--panel); border-right: 1px solid var(--line);
+  overflow-y: auto; padding: 12px 14px 40px;
+}
+fieldset {
+  border: none; border-top: 1px solid var(--line);
+  margin: 0 0 4px; padding: 10px 0 8px;
+}
+fieldset:first-of-type { border-top: none; padding-top: 2px; }
+legend {
+  font: 600 11px var(--sans); letter-spacing: .08em;
+  text-transform: uppercase; color: var(--c); padding: 0;
+}
+.row {
+  display: flex; align-items: center; gap: 8px; margin: 5px 0;
+}
+.row label { flex: 1; color: var(--ink); }
+.row input[type=number], .row select {
+  width: 90px; height: var(--ctrl-h);
+  font: 12px var(--mono); color: var(--ink);
+  background: var(--paper); border: 1px solid var(--line); border-radius: 2px;
+  padding: 0 6px;
+}
+.row input[type=checkbox] { accent-color: var(--accent); }
+.row.wide input, .row.wide select { width: 132px; }
+.row.off { opacity: .38; }
+.row.off input, .row.off select { pointer-events: none; }
+.subhint {
+  font: 10px var(--mono); color: var(--y);
+  margin: -2px 0 6px; padding-left: 2px;
+}
+.triple { display: flex; gap: 4px; }
+.triple input { width: 42px !important; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+button {
+  height: 30px; padding: 0 14px; font: 600 12px var(--sans);
+  color: var(--paper); background: var(--ink);
+  border: none; border-radius: 2px; cursor: pointer;
+}
+button.primary { background: var(--accent); }
+button:disabled { opacity: .45; cursor: default; }
+#actions { display: flex; gap: 8px; margin: 10px 0 2px; }
+
+/* drop zone */
+#drop {
+  border: 1.5px dashed var(--line); border-radius: 3px;
+  padding: 16px 10px; text-align: center; color: var(--ink-soft);
+  cursor: pointer; margin-bottom: 10px; background: var(--paper);
+}
+#drop.armed { border-color: var(--accent); color: var(--accent); }
+#meshinfo { font: 11px var(--mono); color: var(--ink-soft); margin-top: 6px; }
+
+/* preview: the sheet on the wall */
+#stage {
+  overflow: hidden; display: grid; place-items: center; padding: 28px;
+  position: relative; cursor: grab; touch-action: none;
+}
+#stage.dragging { cursor: grabbing; }
+#orbit { position: absolute; inset: 0; width: 100%; height: 100%; }
+#sheet {
+  background: var(--paper);
+  box-shadow: 0 1px 2px rgba(0,0,0,.18), 0 12px 40px rgba(0,0,0,.14);
+}
+#sheet svg { display: block; }
+#hint {
+  position: absolute; bottom: 10px; left: 0; right: 0; text-align: center;
+  font: 11px var(--mono); color: var(--ink-soft); pointer-events: none;
+}
+#dragModes {
+  position: absolute; top: 10px; left: 12px; display: flex; gap: 4px;
+}
+#dragModes button {
+  height: 22px; padding: 0 8px; font: 10px var(--mono);
+  color: var(--ink-soft); background: var(--paper);
+  border: 1px solid var(--line); border-radius: 11px; cursor: pointer;
+}
+#dragModes button.current { border-color: var(--m); color: var(--m); }
+#dragModes button:disabled { opacity: .38; cursor: default; }
+#angles {
+  position: absolute; bottom: 30px; left: 0; right: 0;
+  display: flex; justify-content: center; gap: 6px;
+}
+#angles button {
+  height: 22px; padding: 0 7px; font: 10px var(--mono);
+  color: var(--ink-soft); background: transparent;
+  border: 1px solid var(--line); border-radius: 11px; cursor: pointer;
+}
+#angles button.ready { color: var(--ink); border-color: var(--y); background: var(--paper); }
+#angles button.current { border-color: var(--accent); color: var(--accent); }
+#empty {
+  color: var(--ink-soft); font-size: 13px; text-align: center;
+  max-width: 340px;
+}
+#empty .glyph { font-size: 30px; }
+
+footer a { color: var(--c); text-decoration: none; }
+footer a:hover { text-decoration: underline; }
+footer {
+  grid-column: 1 / -1; padding: 6px 16px;
+  font: 11px var(--mono); color: var(--ink-soft);
+  background: var(--panel); border-top: 1px solid var(--line);
+}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Silverpoint Hatch - Uneditioned</h1>
+  <span class="status" id="status">no model loaded</span>
+  <span class="spacer"></span>
+  <a href="https://www.gnu.org/licenses/agpl-3.0.html">AGPL-3.0</a>
+</header>
+
+<main>
+  <div id="controls">
+    <div id="drop" tabindex="0" role="button"
+         aria-label="Load an STL model">
+      drop an <b>.stl</b> here<br>or click to choose
+      <div id="meshinfo"></div>
+    </div>
+    <input type="file" id="file" accept=".stl" hidden>
+
+    <div id="actions">
+      <button id="run" class="primary" disabled>Draw</button>
+      <button id="dlRaw" disabled>SVG raw</button>
+      <button id="dlChain" disabled>SVG chained</button>
+    </div>
+    <div class="row">
+      <label for="auto">Redraw on change</label>
+      <input type="checkbox" id="auto" checked>
+    </div>
+    <div class="row">
+      <label for="chop" title="Plots as real ink — a single-stroke tag in the bottom-right margin">Plot tag in margin</label>
+      <input type="checkbox" id="chop">
+    </div>
+    <div class="subhint">tiny 'uneditioned.com' in single-stroke ink · bottom-right margin</div>
+
+    <fieldset><legend>Page</legend>
+      <div class="row wide"><label for="page">Size</label>
+        <select id="page">
+          <option value="558.8,762.0">22 × 30 in</option>
+          <option value="762.0,558.8">30 × 22 in</option>
+          <option value="381.0,558.8" selected>15 × 22 in</option>
+          <option value="558.8,381.0">22 × 15 in</option>
+          <option value="279.4,381.0">11 × 15 in</option>
+          <option value="381.0,279.4">15 × 11 in</option>
+          <option value="custom">Custom (in)</option>
+        </select></div>
+      <div class="row off" id="customPage"><label>W × H in</label>
+        <span class="triple">
+          <input type="number" id="pageW" value="15" step="0.5" disabled>
+          <input type="number" id="pageH" value="22" step="0.5" disabled>
+        </span></div>
+      <div class="row"><label for="margin">Margin (mm)</label>
+        <input type="number" id="margin" value="25" min="0" step="1"></div>
+      <div class="row"><label for="zoom" title="1 = fit with a little air · 2 = twice as close">Zoom</label>
+        <input type="number" id="zoom" value="1" min="0.25" max="8" step="0.05"
+               title="1 = fit with a little air · 2 = twice as close"></div>
+    </fieldset>
+
+    <fieldset><legend>View</legend>
+      <div class="row wide"><label for="view">Direction</label>
+        <select id="view">
+          <option value="0,-1,0" selected>Front</option>
+          <option value="0,1,0">Back</option>
+          <option value="1,0,0">Right</option>
+          <option value="-1,0,0">Left</option>
+          <option value="0,0,1">Top</option>
+          <option value="0,0,-1">Bottom</option>
+          <option value="custom">Custom vector</option>
+        </select></div>
+      <div class="row" id="customView" hidden><label>X Y Z</label>
+        <span class="triple">
+          <input type="number" id="viewX" value="0" step="0.05">
+          <input type="number" id="viewY" value="-1" step="0.05">
+          <input type="number" id="viewZ" value="0" step="0.05">
+        </span></div>
+    </fieldset>
+
+    <fieldset><legend>Light</legend>
+      <div class="row wide"><label for="keySource">Key source</label>
+        <select id="keySource">
+          <option value="DIALS">Camera-relative dials</option>
+          <option value="CUBE" selected>Cube corner (world)</option>
+        </select></div>
+      <div class="row wide" id="cubeRow"><label for="cubeCorner">Corner</label>
+        <select id="cubeCorner">
+          <option value="-1,-1,1" selected>Front Top Left</option>
+          <option value="1,-1,1">Front Top Right</option>
+          <option value="-1,1,1">Back Top Left</option>
+          <option value="1,1,1">Back Top Right</option>
+          <option value="-1,-1,-1">Front Bottom Left</option>
+          <option value="1,-1,-1">Front Bottom Right</option>
+          <option value="-1,1,-1">Back Bottom Left</option>
+          <option value="1,1,-1">Back Bottom Right</option>
+        </select></div>
+      <div class="row off" id="dialAz"><label for="lightAz">Key left / right</label>
+        <input type="number" id="lightAz" value="-25" min="-180" max="180" step="5" disabled></div>
+      <div class="row off" id="dialEl"><label for="lightEl">Key up / down</label>
+        <input type="number" id="lightEl" value="30" min="-90" max="90" step="5" disabled></div>
+      <div class="row"><label for="wrap"
+        title="How far light bends past the terminator into shadow">Soft wrap</label>
+        <input type="number" id="wrap" value="0" min="0" max="1" step="0.05"
+        title="How far light bends past the terminator into shadow"></div>
+      <div class="subhint">0 = crisp shadow edge · 1 = light wraps far into shadow</div>
+      <div class="row"><label for="fill"
+        title="A second, dimmer lamp opposite the key that lifts the shadow side">Fill strength</label>
+        <input type="number" id="fill" value="0" min="0" max="1" step="0.05"
+        title="A second, dimmer lamp opposite the key that lifts the shadow side"></div>
+      <div class="subhint">second lamp opposite the key · 0 = off · 0.3 = gentle lift</div>
+      <div class="row"><label for="ambient">Ambient</label>
+        <input type="number" id="ambient" value="0.25" min="0" max="1" step="0.05"></div>
+    </fieldset>
+
+    <fieldset><legend>Tone</legend>
+      <div class="row"><label for="useAO">Ambient occlusion</label>
+        <input type="checkbox" id="useAO" checked></div>
+      <div class="row"><label for="aoSamples"
+        title="Rays fired per surface point to measure crevice shadow">AO samples</label>
+        <input type="number" id="aoSamples" value="4" min="4" max="64" step="4"
+        title="Rays fired per surface point to measure crevice shadow"></div>
+      <div class="subhint">more = smoother shading · cost grows linearly (16 ≈ 4× slower)</div>
+      <div class="row"><label for="aoDist"
+        title="How far each ray looks for cover, as a fraction of model size">AO distance</label>
+        <input type="number" id="aoDist" value="0.10" min="0.02" max="1" step="0.02"
+        title="How far each ray looks for cover, as a fraction of model size"></div>
+      <div class="subhint">small = only tight crevices darken · large = broad soft shading, slightly slower</div>
+      <div class="row"><label for="darkMax">Darkness cap</label>
+        <input type="number" id="darkMax" value="0.80" min="0.1" max="1" step="0.05"></div>
+      <div class="row"><label for="gamma">Tone gamma</label>
+        <input type="number" id="gamma" value="1.0" min="0.3" max="3" step="0.1"></div>
+    </fieldset>
+
+    <fieldset><legend>Hatching</legend>
+      <div class="row wide"><label for="mode">Angle mode</label>
+        <select id="mode">
+          <option value="SCREEN">Screen angle</option>
+          <option value="WORLD" selected>World normals</option>
+        </select></div>
+      <div class="row off" id="baseRow"><label for="baseAngle">Base angle</label>
+        <input type="number" id="baseAngle" value="0" min="-180" max="180" step="5" disabled></div>
+      <div class="row wide off" id="crossRow"><label for="crossAngle">Cross angle</label>
+        <select id="crossAngle" disabled>
+          <option value="NONE">None</option>
+          <option value="15">+15°</option>
+          <option value="45" selected>+45°</option>
+          <option value="75">+75°</option>
+          <option value="90">+90°</option>
+          <option value="ALL">All four</option>
+        </select></div>
+      <div class="row" id="worldA"><label title="Hatch family A follows planes perpendicular to this vector">Plane A</label>
+        <span class="triple">
+          <input type="number" id="nAX" value="0" step="0.1">
+          <input type="number" id="nAY" value="0" step="0.1">
+          <input type="number" id="nAZ" value="1" step="0.1">
+        </span></div>
+      <div class="row" id="worldB"><label title="Hatch family B follows planes perpendicular to this vector">Plane B</label>
+        <span class="triple">
+          <input type="number" id="nBX" value="1" step="0.1">
+          <input type="number" id="nBY" value="0" step="0.1">
+          <input type="number" id="nBZ" value="0" step="0.1">
+        </span></div>
+      <div class="row" id="useCRow"><label for="useC"
+        title="A third slicing plane that hatches only the darkest zones">Plane C (deep)</label>
+        <input type="checkbox" id="useC"></div>
+      <div class="row off" id="worldC"><label title="Hatch family C follows planes perpendicular to this vector">Plane C</label>
+        <span class="triple">
+          <input type="number" id="nCX" value="0" step="0.1" disabled>
+          <input type="number" id="nCY" value="1" step="0.1" disabled>
+          <input type="number" id="nCZ" value="0" step="0.1" disabled>
+        </span></div>
+      <div class="row off" id="deepRow"><label for="tDeep"
+        title="Tone above which the third family enters">Deep cutoff</label>
+        <input type="number" id="tDeep" value="0.75" min="0" max="1" step="0.05" disabled></div>
+      <div class="subhint">plane vector = hatch aim · (0,0,1) = level contour bands · (1,0,0) = vertical bands</div>
+      <div class="row wide"><label for="dither"
+        title="Order in which lines drop out as tone lightens">Dither</label>
+        <select id="dither">
+          <option value="vdc" selected>van der Corput</option>
+          <option value="golden">Golden ratio</option>
+          <option value="white">White noise</option>
+        </select></div>
+      <div class="subhint">vdC = smoothest · golden = aperiodic, less family moiré · white = grainy</div>
+      <div class="row"><label for="linesA">Lines A</label>
+        <input type="number" id="linesA" value="250" min="10" max="3000" step="10"></div>
+      <div class="row"><label for="linesB">Lines B</label>
+        <input type="number" id="linesB" value="250" min="10" max="3000" step="10"></div>
+      <div class="row"><label for="tLight">Highlight cutoff</label>
+        <input type="number" id="tLight" value="0.20" min="0" max="1" step="0.05"></div>
+      <div class="row"><label for="tCross">Crosshatch cutoff</label>
+        <input type="number" id="tCross" value="0.65" min="0" max="1" step="0.05"></div>
+    </fieldset>
+
+    <fieldset><legend>Visibility</legend>
+      <div class="row"><label for="occl">Hidden-line removal</label>
+        <input type="checkbox" id="occl" checked></div>
+      <div class="row"><label for="silh">Silhouette</label>
+        <input type="checkbox" id="silh" checked></div>
+      <div class="row"><label for="pen"
+        title="Plotted stroke width in mm — set to your pen. Silhouette draws 1.5x heavier.">Pen width (mm)</label>
+        <input type="number" id="pen" value="0.30" min="0.05" max="2" step="0.05"></div>
+      <div class="row"><label for="offset">Surface offset</label>
+        <input type="number" id="offset" value="0.0015" min="0" max="0.05" step="0.0005"></div>
+      <div class="row"><label for="backface">Backface cutoff</label>
+        <input type="number" id="backface" value="0.05" min="-0.5" max="0.5" step="0.01"></div>
+      <div class="row"><label for="minSeg">Min seg length</label>
+        <input type="number" id="minSeg" value="0" min="0" max="0.05" step="0.001"></div>
+      <div class="row"><label for="maxSegs">Max segments</label>
+        <input type="number" id="maxSegs" value="400000" min="1000" step="10000"></div>
+    </fieldset>
+  </div>
+
+  <div id="stage">
+    <div id="empty">
+      <div class="glyph">✎</div>
+      Drop an STL to draw it as silverpoint crosshatch.<br>
+      Everything runs in your browser — the model never leaves your machine.
+    </div>
+    <div id="sheet" hidden></div>
+    <canvas id="orbit" hidden></canvas>
+    <div id="dragModes" hidden>
+      <button data-mode="rotate" class="current">rotate</button>
+      <button data-mode="planeA">plane A</button>
+      <button data-mode="planeB">plane B</button>
+      <button data-mode="planeC">plane C</button>
+    </div>
+    <div id="angles" hidden></div>
+    <div id="hint" hidden>drag to rotate — redraws on release</div>
+  </div>
+</main>
+
+<footer>© 2026 Brian Hart · <a href="https://thebrianhart.com" target="_blank" rel="noopener">thebrianhart.com</a> · <a href="https://uneditioned.com" target="_blank" rel="noopener">uneditioned.com</a> · AGPL-3.0 · drawings you make here are yours</footer>
+
+<!-- ====================== the worker: algorithm island ====================
+     Everything inside this tag runs in a Web Worker. It is the validated
+     silverpoint core (byte-identical to the reference implementation) plus
+     an STL parser, a BVH ray-caster, and a small caching protocol. -->
+<script id="worker-src" type="text/plain">
+'use strict';
+// SPDX-License-Identifier: AGPL-3.0-only
+%%CORE%%
+
+// ---------- STL parser (binary + ascii), welded -----------------------------
+function parseSTL(buffer, weldDecimals = 6) {
+  const dv = new DataView(buffer);
+  const verts = [], tris = [], index = new Map();
+  const f = 10 ** weldDecimals;
+  const add = (x, y, z) => {
+    const key = Math.round(x * f) + ',' + Math.round(y * f) + ',' + Math.round(z * f);
+    let i = index.get(key);
+    if (i === undefined) { i = verts.length; index.set(key, i); verts.push([x, y, z]); }
+    return i;
+  };
+  // ascii? ("solid" + no plausible binary count)
+  const head = new TextDecoder().decode(buffer.slice(0, 5));
+  const looksBinary = buffer.byteLength >= 84 &&
+    84 + dv.getUint32(80, true) * 50 === buffer.byteLength;
+  if (head === 'solid' && !looksBinary) {
+    const text = new TextDecoder().decode(buffer);
+    let cur = [];
+    for (const line of text.split('\n')) {
+      const t = line.trim().split(/\s+/);
+      if (t[0] === 'vertex') {
+        cur.push(add(parseFloat(t[1]), parseFloat(t[2]), parseFloat(t[3])));
+        if (cur.length === 3) {
+          if (cur[0] !== cur[1] && cur[1] !== cur[2] && cur[2] !== cur[0])
+            tris.push([cur[0], cur[1], cur[2]]);
+          cur = [];
+        }
+      }
+    }
+    return [verts, tris];
+  }
+  const n = dv.getUint32(80, true);
+  let o = 84;
+  for (let t = 0; t < n; t++) {
+    const ia = add(dv.getFloat32(o + 12, true), dv.getFloat32(o + 16, true), dv.getFloat32(o + 20, true));
+    const ib = add(dv.getFloat32(o + 24, true), dv.getFloat32(o + 28, true), dv.getFloat32(o + 32, true));
+    const ic = add(dv.getFloat32(o + 36, true), dv.getFloat32(o + 40, true), dv.getFloat32(o + 44, true));
+    if (ia !== ib && ib !== ic && ic !== ia) tris.push([ia, ib, ic]);
+    o += 50;
+  }
+  return [verts, tris];
+}
+
+// ---------- BVH ray-caster (median-split, typed arrays) ----------------------
+class BVH {
+  constructor(verts, tris, leafSize = 4) {
+    const n = tris.length;
+    this.p0 = new Float64Array(n * 3);
+    this.e1 = new Float64Array(n * 3);
+    this.e2 = new Float64Array(n * 3);
+    const cen = new Float64Array(n * 3);
+    const bmin = new Float64Array(n * 3), bmax = new Float64Array(n * 3);
+    for (let t = 0; t < n; t++) {
+      const [ia, ib, ic] = tris[t];
+      const A = verts[ia], B = verts[ib], C = verts[ic];
+      for (let k = 0; k < 3; k++) {
+        this.p0[t * 3 + k] = A[k];
+        this.e1[t * 3 + k] = B[k] - A[k];
+        this.e2[t * 3 + k] = C[k] - A[k];
+        cen[t * 3 + k] = (A[k] + B[k] + C[k]) / 3;
+        bmin[t * 3 + k] = Math.min(A[k], B[k], C[k]);
+        bmax[t * 3 + k] = Math.max(A[k], B[k], C[k]);
+      }
+    }
+    this.order = new Uint32Array(n);
+    for (let i = 0; i < n; i++) this.order[i] = i;
+    this.nodes = [];
+    this.leafSize = leafSize;
+    this._build(0, n, cen, bmin, bmax);
+  }
+  _build(start, end, cen, bmin, bmax) {
+    const mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+    for (let i = start; i < end; i++) {
+      const t = this.order[i];
+      for (let k = 0; k < 3; k++) {
+        if (bmin[t * 3 + k] < mn[k]) mn[k] = bmin[t * 3 + k];
+        if (bmax[t * 3 + k] > mx[k]) mx[k] = bmax[t * 3 + k];
+      }
+    }
+    const id = this.nodes.length;
+    this.nodes.push({ min: mn, max: mx, left: -1, right: -1, start, count: end - start });
+    if (end - start <= this.leafSize) return id;
+    let axis = 0, best = -1;
+    for (let k = 0; k < 3; k++) {
+      const ext = mx[k] - mn[k];
+      if (ext > best) { best = ext; axis = k; }
+    }
+    const sub = Array.from(this.order.slice(start, end));
+    sub.sort((a, b) => cen[a * 3 + axis] - cen[b * 3 + axis]);
+    this.order.set(sub, start);
+    const mid = start + ((end - start) >> 1);
+    if (mid === start || mid === end) return id;
+    const node = this.nodes[id];
+    node.count = 0;
+    node.left = this._build(start, mid, cen, bmin, bmax);
+    node.right = this._build(mid, end, cen, bmin, bmax);
+    return id;
+  }
+  _hitBox(node, O, invD, tMax) {
+    let t0 = 1e-9, t1 = tMax;
+    for (let k = 0; k < 3; k++) {
+      let a = (node.min[k] - O[k]) * invD[k];
+      let b = (node.max[k] - O[k]) * invD[k];
+      if (a > b) { const tmp = a; a = b; b = tmp; }
+      if (a > t0) t0 = a;
+      if (b < t1) t1 = b;
+      if (t0 > t1) return false;
+    }
+    return true;
+  }
+  _hitTri(t, O, D, tMax) {
+    const i = t * 3;
+    const e1x = this.e1[i], e1y = this.e1[i + 1], e1z = this.e1[i + 2];
+    const e2x = this.e2[i], e2y = this.e2[i + 1], e2z = this.e2[i + 2];
+    const pvx = D[1] * e2z - D[2] * e2y;
+    const pvy = D[2] * e2x - D[0] * e2z;
+    const pvz = D[0] * e2y - D[1] * e2x;
+    const det = e1x * pvx + e1y * pvy + e1z * pvz;
+    if (Math.abs(det) < 1e-12) return null;
+    const inv = 1.0 / det;
+    const tvx = O[0] - this.p0[i], tvy = O[1] - this.p0[i + 1], tvz = O[2] - this.p0[i + 2];
+    const u = (tvx * pvx + tvy * pvy + tvz * pvz) * inv;
+    if (u < 0 || u > 1) return null;
+    const qvx = tvy * e1z - tvz * e1y;
+    const qvy = tvz * e1x - tvx * e1z;
+    const qvz = tvx * e1y - tvy * e1x;
+    const v = (D[0] * qvx + D[1] * qvy + D[2] * qvz) * inv;
+    if (v < 0 || u + v > 1) return null;
+    const tt = (e2x * qvx + e2y * qvy + e2z * qvz) * inv;
+    return (tt > 1e-9 && tt <= tMax) ? tt : null;
+  }
+  raycast(O, D, maxDist) {
+    const invD = [1 / D[0], 1 / D[1], 1 / D[2]];
+    let best = null, bestT = maxDist;
+    const stack = [0];
+    while (stack.length) {
+      const node = this.nodes[stack.pop()];
+      if (!this._hitBox(node, O, invD, bestT)) continue;
+      if (node.count > 0) {
+        for (let i = node.start; i < node.start + node.count; i++) {
+          const tt = this._hitTri(this.order[i], O, D, bestT);
+          if (tt !== null && tt < bestT) { bestT = tt; best = tt; }
+        }
+      } else {
+        stack.push(node.left, node.right);
+      }
+    }
+    return best;
+  }
+}
+
+// ---------- caching protocol --------------------------------------------------
+// The worker persists between runs. Mesh, BVH, normals live for the life of
+// the loaded model; AO is cached against the settings that shaped it.
+const S = { verts: null, tris: null, bvh: null, vnorm: null,
+            ao: null, aoKey: null };
+
+onmessage = (ev) => {
+  const msg = ev.data;
+  try {
+    if (msg.type === 'mesh') {
+      const t0 = Date.now();
+      [S.verts, S.tris] = parseSTL(msg.buffer);
+      S.bvh = new BVH(S.verts, S.tris);
+      S.vnorm = vertexNormals(S.verts, S.tris);
+      S.ao = null; S.aoKey = null;
+      // preview payload: an even subset of unique edges, packed flat, so the
+      // page can wireframe the model at 60fps during a view drag without any
+      // 3D library — it reuses the same ortho projection math as the export.
+      const seen = new Set();
+      const uniq = [];
+      for (const t of S.tris)
+        for (const [a, b] of [[t[0], t[1]], [t[1], t[2]], [t[2], t[0]]]) {
+          const key = a < b ? a * S.verts.length + b : b * S.verts.length + a;
+          if (!seen.has(key)) { seen.add(key); uniq.push([a, b]); }
+        }
+      const MAXE = 8000;
+      const step = Math.max(1, Math.floor(uniq.length / MAXE));
+      const picked = [];
+      for (let i = 0; i < uniq.length; i += step) picked.push(uniq[i]);
+      const edges = new Float32Array(picked.length * 6);
+      picked.forEach(([a, b], i) => {
+        edges.set(S.verts[a], i * 6);
+        edges.set(S.verts[b], i * 6 + 3);
+      });
+      const [center, diag] = meshBounds(S.verts);
+      let lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+      for (const v of S.verts)
+        for (let k = 0; k < 3; k++) {
+          if (v[k] < lo[k]) lo[k] = v[k];
+          if (v[k] > hi[k]) hi[k] = v[k];
+        }
+      // full mesh for the page's plane-contour preview: one plane x all
+      // triangles is ~1ms of dot products, cheap enough to do per drag frame
+      const vertsF32 = new Float32Array(S.verts.length * 3);
+      S.verts.forEach((v, i) => vertsF32.set(v, i * 3));
+      const trisU32 = new Uint32Array(S.tris.length * 3);
+      S.tris.forEach((t, i) => trisU32.set(t, i * 3));
+      postMessage({ type: 'meshinfo', verts: S.verts.length,
+                    tris: S.tris.length, ms: Date.now() - t0,
+                    edges, center, diag, vertsF32, trisU32,
+                    size: [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]] },
+                  [edges.buffer, vertsF32.buffer, trisU32.buffer]);
+      return;
+    }
+    if (msg.type === 'planeslice') {
+      // One plane through the model center, perpendicular to msg.normal:
+      // the raw geometric contour (no occlusion, no tone, no dither) for
+      // the live plane-aiming overlay. ~1ms — fine for 60fps round-trips.
+      if (!S.verts) return;
+      const s = msg.settings;
+      const [center, diag] = meshBounds(S.verts);
+      const cam = makeCamera(center, diag, s.viewDir, s.up, s.orthoZoom, s.pageMM);
+      let n = msg.normal;
+      const nl = Math.hypot(n[0], n[1], n[2]) || 1;
+      n = [n[0] / nl, n[1] / nl, n[2] / nl];
+      const segs = [];
+      for (const [ia, ib, ic] of S.tris) {
+        const tri = [S.verts[ia], S.verts[ib], S.verts[ic]];
+        const d = tri.map(v => (v[0] - center[0]) * n[0] +
+                               (v[1] - center[1]) * n[1] +
+                               (v[2] - center[2]) * n[2]);
+        const pts = [];
+        for (let i = 0; i < 3; i++) {
+          const j = (i + 1) % 3;
+          if ((d[i] > 0) !== (d[j] > 0)) {
+            const t = d[i] / (d[i] - d[j]);
+            const a = tri[i], b = tri[j];
+            pts.push([a[0] + t * (b[0] - a[0]),
+                      a[1] + t * (b[1] - a[1]),
+                      a[2] + t * (b[2] - a[2])]);
+          }
+        }
+        if (pts.length === 2) {
+          const p = projectMM(cam, s.pageMM, s.marginMM, pts[0]);
+          const q = projectMM(cam, s.pageMM, s.marginMM, pts[1]);
+          segs.push(p[0], p[1], q[0], q[1]);
+        }
+      }
+      const arr = new Float32Array(segs);
+      postMessage({ type: 'planeslice', segs: arr, tag: msg.tag }, [arr.buffer]);
+      return;
+    }
+    if (msg.type === 'run') {
+      if (!S.verts) { postMessage({ type: 'error', message: 'No model loaded yet — drop an STL first.', tag: msg.tag }); return; }
+      const s = msg.settings;
+      const raycast = (o, d, m) => S.bvh.raycast(o, d, m);
+      const timings = {};
+
+      const aoKey = s.useAO ? s.aoSamples + '|' + s.aoDistFrac : 'off';
+      if (S.aoKey !== aoKey) {
+        const t0 = Date.now();
+        if (s.useAO) {
+          const [, diag] = meshBounds(S.verts);
+          S.ao = computeAO(S.verts, S.vnorm, raycast, s.aoSamples,
+                           s.aoDistFrac, diag,
+            (d, t) => postMessage({ type: 'progress', phase: 'ambient occlusion',
+                                    pct: Math.round(100 * d / t) }));
+        } else {
+          S.ao = new Array(S.verts.length).fill(1.0);
+        }
+        S.aoKey = aoKey;
+        timings.ao = Date.now() - t0;
+      } else timings.ao = 0;
+
+      const t1 = Date.now();
+      const [layers, cam] = generate(S.verts, S.tris, raycast, s, S.ao, S.vnorm);
+      timings.slice = Date.now() - t1;
+
+      const total = layers.reduce((a, [, seg]) => a + seg.length, 0);
+      if (total > s.maxSegments) {
+        postMessage({ type: 'error', message:
+          total.toLocaleString() + ' segments exceeds the cap (' +
+          s.maxSegments.toLocaleString() + '). Lower the line counts, raise ' +
+          'the highlight cutoff, or raise Max segments.', tag: msg.tag });
+        return;
+      }
+      const svg = svgString(layers, cam, s.pageMM, s.marginMM, s.penMM);
+      const counts = {};
+      for (const [n, seg] of layers) counts[n] = seg.length;
+      postMessage({ type: 'result', svg, counts, total, timings, tag: msg.tag });
+    }
+  } catch (err) {
+    postMessage({ type: 'error', message: String(err && err.message || err),
+                  tag: ev.data && ev.data.tag });
+  }
+};
+</script>
+
+<script>
+'use strict';
+/* main thread: UI wiring only — the algorithm never runs here. */
+
+const $ = id => document.getElementById(id);
+
+// ---- worker from the embedded source ----------------------------------------
+// Preferred: a real Web Worker (UI stays live during draws). Fallback: some
+// sandboxes (strict CSPs, embedded previews) forbid blob workers — then we
+// run the identical code on the main thread. Same output; the page just
+// pauses during a draw instead of staying interactive.
+const workerSource = document.getElementById('worker-src').textContent;
+let worker, workerMode;
+try {
+  const workerURL = URL.createObjectURL(new Blob([workerSource],
+    { type: 'text/javascript' }));
+  worker = new Worker(workerURL);
+  workerMode = 'worker';
+} catch (err) {
+  const shim = { onmessage: null };
+  const send = (msg) => setTimeout(() => shim.onmessage && shim.onmessage({ data: msg }), 0);
+  // Build the worker scope by hand: declare onmessage, provide postMessage,
+  // return the handler the source installs.
+  const handler = new Function('postMessage',
+    'var onmessage = null;\n' + workerSource + '\nreturn onmessage;')(send);
+  shim.postMessage = (msg) => setTimeout(() => handler({ data: msg }), 0);
+  worker = shim;
+  workerMode = 'fallback';
+}
+
+let lastSVG = null, meshLoaded = false, running = false, queued = false;
+let preview = null;                     // {edges: Float32Array, center, diag, size}
+// adaptive live mode: measured cost of one AO-cached re-render. If it's
+// under LIVE_MS, dragging re-renders the REAL drawing continuously instead
+// of the wireframe proxy. The tool calibrates itself from its own timings.
+let perViewMs = null;
+const LIVE_MS = 120;
+let liveMode = false, liveInFlight = false, livePending = false;
+function notePerView(t) {
+  perViewMs = perViewMs === null ? t : perViewMs * 0.6 + t * 0.4;
+}
+
+worker.onmessage = (ev) => {
+  const m = ev.data;
+  if (m.type === 'meshinfo') {
+    meshLoaded = true;
+    preview = { edges: m.edges, center: m.center, diag: m.diag, size: m.size };
+    $('meshinfo').textContent =
+      m.verts.toLocaleString() + ' verts · ' + m.tris.toLocaleString() +
+      ' tris · ready in ' + m.ms + ' ms';
+    $('run').disabled = false;
+    $('hint').hidden = false;
+    $('dragModes').hidden = false;
+    updateDragModeUI();
+    setStatus('model loaded');
+    scheduleRun();                       // draw immediately on load
+  }
+  if (m.type === 'planeslice') {
+    psInFlight = false;
+    psSegs = m.segs;
+    if (dragging && dragMode !== 'rotate') {
+      drawPlaneOverlay();
+      if (psPending) { psPending = false; requestPlaneSlice(); }
+    }
+    return;
+  }
+  if (m.type === 'progress')
+    setStatus(m.phase + ' ' + m.pct + '%');
+  if (m.type === 'result') {
+    running = false;
+    if (m.timings && m.timings.ao === 0) notePerView(m.timings.slice + 40);
+    if (m.tag && m.tag.live) {           // continuous drag/spin frame
+      liveInFlight = false;
+      showDrawing(m.svg, m.counts, 'live · az ' + orbit.az.toFixed(0) +
+                  '° el ' + orbit.el.toFixed(0) + '°');
+      if (dragging && livePending) { livePending = false; requestLiveFrame(); }
+      else if (spin.playing && spin.mode === 'live' && !dragging) {
+        orbit.az = (orbit.az + 2) % 360;
+        requestLiveFrame();
+      }
+      return;
+    }
+    if (m.tag && m.tag.bg) {             // silent turntable render
+      TT.cache.set(m.tag.az, { svg: m.svg, counts: m.counts });
+      updateStrip();
+      if (queued) { queued = false; scheduleRun(0); }
+      else TT.timer = setTimeout(renderNextAngle, 120);
+      return;
+    }
+    showDrawing(m.svg, m.counts,
+      'ao ' + (m.timings.ao / 1000).toFixed(1) + 's · slice ' +
+      (m.timings.slice / 1000).toFixed(1) + 's');
+    afterUserDraw(m);
+    if (queued) { queued = false; scheduleRun(0); }
+    else scheduleTurntable();
+  }
+  if (m.type === 'error') {
+    running = false;
+    if (m.tag && m.tag.bg) return;       // background failures stay silent
+    setStatus('⚠ ' + m.message);
+  }
+};
+
+function showDrawing(svg, counts, extra) {
+  lastSVG = svg;
+  const sheet = $('sheet');
+  sheet.innerHTML = withChop(svg);
+  fitSheet();
+  sheet.hidden = false; $('empty').hidden = true;
+  $('dlRaw').disabled = false; $('dlChain').disabled = false;
+  const parts = Object.entries(counts)
+    .map(([k, v]) => k + ' ' + v.toLocaleString()).join(' · ');
+  setStatus(parts + (extra ? '  |  ' + extra : ''));
+}
+
+function setStatus(t) { $('status').textContent = t; }
+
+// ---- collect settings from the panel ----------------------------------------
+function vec(idX, idY, idZ) {
+  return [parseFloat($(idX).value), parseFloat($(idY).value), parseFloat($(idZ).value)];
+}
+function settings() {
+  const pageSel = $('page').value;
+  const pageMM = pageSel === 'custom'
+    ? [parseFloat($('pageW').value) * 25.4, parseFloat($('pageH').value) * 25.4]
+    : pageSel.split(',').map(parseFloat);
+  // UI zoom is intuitive (2 = twice as close); the core's orthoZoom is
+  // padding (bigger = smaller model). Zoom 1 == the reference 1.15 framing.
+  const orthoZoom = 1.15 / Math.max(0.05, parseFloat($('zoom').value));
+  const viewSel = $('view').value;
+  const viewDir = viewSel === 'custom'
+    ? vec('viewX', 'viewY', 'viewZ') : viewSel.split(',').map(parseFloat);
+  // Light cube: corners at center ± h on each axis, h = model Z height
+  // (cube edge = 2x STL height). Front = -Y, Right = +X, Top = +Z.
+  let lightPos = null;
+  if ($('keySource').value === 'CUBE' && preview) {
+    const h = preview.size[2];
+    const c = $('cubeCorner').value.split(',').map(parseFloat);
+    lightPos = [preview.center[0] + c[0] * h,
+                preview.center[1] + c[1] * h,
+                preview.center[2] + c[2] * h];
+  }
+  return {
+    pageMM, marginMM: parseFloat($('margin').value),
+    viewDir, up: [0, 0, 1], orthoZoom,
+    lightDir: null, lightPos,
+    lightAz: parseFloat($('lightAz').value), lightEl: parseFloat($('lightEl').value),
+    fillStrength: parseFloat($('fill').value), fillAz: 150, fillEl: 0,
+    wrap: parseFloat($('wrap').value), ambient: parseFloat($('ambient').value),
+    useAO: $('useAO').checked,
+    aoSamples: parseInt($('aoSamples').value),
+    aoDistFrac: parseFloat($('aoDist').value),
+    darknessMax: parseFloat($('darkMax').value),
+    toneGamma: parseFloat($('gamma').value),
+    hatchAngleMode: $('mode').value,
+    normalA: vec('nAX', 'nAY', 'nAZ'), normalB: vec('nBX', 'nBY', 'nBZ'),
+    normalC: ($('mode').value === 'WORLD' && $('useC').checked)
+      ? vec('nCX', 'nCY', 'nCZ') : null,
+    tDeep: parseFloat($('tDeep').value),
+    ditherMethod: $('dither').value,
+    penMM: parseFloat($('pen').value),
+    vesselAxis: null,
+    nLinesA: parseInt($('linesA').value), nLinesB: parseInt($('linesB').value),
+    baseAngle: parseFloat($('baseAngle').value), crossAngle: $('crossAngle').value,
+    tLight: parseFloat($('tLight').value), tCross: parseFloat($('tCross').value),
+    minSegFrac: parseFloat($('minSeg').value),
+    offsetFrac: parseFloat($('offset').value),
+    doOcclusion: $('occl').checked, doSilhouette: $('silh').checked,
+    backfaceCutoff: parseFloat($('backface').value),
+    maxSegments: parseInt($('maxSegs').value),
+  };
+}
+
+// ---- run scheduling -----------------------------------------------------------
+let timer = null;
+function scheduleRun(delay = 450) {
+  if (!meshLoaded) return;
+  clearTimeout(timer);
+  timer = setTimeout(() => {
+    if (running) { queued = true; return; }
+    running = true;
+    setStatus('drawing…');
+    worker.postMessage({ type: 'run', settings: settings() });
+  }, delay);
+}
+
+$('run').addEventListener('click', () => scheduleRun(0));
+document.querySelectorAll('#controls input, #controls select').forEach(el => {
+  el.addEventListener('change', () => {
+    if (el.id === 'chop') {                // display-only: no pipeline run
+      if (lastSVG) { $('sheet').innerHTML = withChop(lastSVG); fitSheet(); }
+      return;
+    }
+    const customPg = $('page').value === 'custom';
+    $('customPage').classList.toggle('off', !customPg);
+    $('pageW').disabled = !customPg; $('pageH').disabled = !customPg;
+    $('customView').hidden = $('view').value !== 'custom';
+    const world = $('mode').value === 'WORLD';
+    $('worldA').classList.toggle('off', !world);
+    $('worldB').classList.toggle('off', !world);
+    for (const id of ['nAX','nAY','nAZ','nBX','nBY','nBZ']) $(id).disabled = !world;
+    $('baseRow').classList.toggle('off', world);
+    $('crossRow').classList.toggle('off', world);
+    $('baseAngle').disabled = world; $('crossAngle').disabled = world;
+    const useC = world && $('useC').checked;
+    $('useCRow').classList.toggle('off', !world);
+    $('useC').disabled = !world;
+    $('worldC').classList.toggle('off', !useC);
+    $('deepRow').classList.toggle('off', !useC);
+    for (const id of ['nCX','nCY','nCZ','tDeep']) $(id).disabled = !useC;
+    updateDragModeUI();
+    const cube = $('keySource').value === 'CUBE';
+    $('cubeRow').classList.toggle('off', !cube);
+    $('cubeCorner').disabled = !cube;
+    for (const id of ['dialAz', 'dialEl'])
+      $(id).classList.toggle('off', cube);
+    $('lightAz').disabled = cube; $('lightEl').disabled = cube;
+    clearTimeout(TT.timer);              // user is busy — pause turntable
+    stopSpin(false);
+    if ($('auto').checked) scheduleRun();
+  });
+});
+
+// ---- model loading --------------------------------------------------------------
+function loadFile(file) {
+  if (!file) return;
+  setStatus('reading ' + file.name + '…');
+  file.arrayBuffer().then(buf =>
+    worker.postMessage({ type: 'mesh', buffer: buf }, [buf]));
+}
+$('drop').addEventListener('click', () => $('file').click());
+$('drop').addEventListener('keydown', e => {
+  if (e.key === 'Enter' || e.key === ' ') $('file').click();
+});
+$('file').addEventListener('change', e => loadFile(e.target.files[0]));
+['dragover', 'dragenter'].forEach(t => document.addEventListener(t, e => {
+  e.preventDefault(); $('drop').classList.add('armed');
+}));
+['dragleave', 'drop'].forEach(t => document.addEventListener(t, e => {
+  e.preventDefault(); $('drop').classList.remove('armed');
+}));
+document.addEventListener('drop', e => loadFile(e.dataTransfer.files[0]));
+
+// ---- preview sizing + download ---------------------------------------------------
+function fitSheet() {
+  const svg = $('sheet').querySelector('svg');
+  if (!svg) return;
+  const stage = $('stage');
+  const wmm = parseFloat(svg.getAttribute('width'));
+  const hmm = parseFloat(svg.getAttribute('height'));
+  const scale = Math.min((stage.clientWidth - 60) / wmm,
+                         (stage.clientHeight - 60) / hmm);
+  svg.setAttribute('width', (wmm * scale) + 'px');
+  svg.setAttribute('height', (hmm * scale) + 'px');
+}
+window.addEventListener('resize', fitSheet);
+
+// ---- orbit: drag to rotate the view -----------------------------------------------
+// View vector convention (matches the core): viewDir points from the model
+// toward the camera. az orbits around world Z (0 = Front, +90 = Right),
+// el tilts toward Top. Note: rotating NEVER recomputes AO — occlusion is a
+// property of the surface, not the view — so release costs only tone+slice.
+const orbit = { az: 0, el: 0 };
+
+function viewFromOrbit() {
+  const a = orbit.az * Math.PI / 180, e = orbit.el * Math.PI / 180;
+  return [Math.sin(a) * Math.cos(e), -Math.cos(a) * Math.cos(e), Math.sin(e)];
+}
+function azElOf(v) {
+  const L = Math.hypot(v[0], v[1], v[2]) || 1;
+  return { el: Math.asin(Math.max(-1, Math.min(1, v[2] / L))) * 180 / Math.PI,
+           az: Math.atan2(v[0], -v[1]) * 180 / Math.PI };
+}
+function orbitFromView(v) {
+  const r = azElOf(v);
+  orbit.az = r.az; orbit.el = r.el;
+}
+
+// ---- turntable: silent 8-angle pre-render ------------------------------------
+// After a draw settles for 1.2 s, the worker quietly renders the other seven
+// 45-degree views at the current elevation. Same settings => AO cache is
+// shared, so each extra angle costs only a slice (~0.5-1 s). Filled dots are
+// instant to open. Any non-view settings change throws the cache away.
+const TT = { cache: new Map(), key: null, el: 0, timer: null };
+const TT_AZ = [0, 45, 90, 135, 180, 225, 270, 315];
+
+function ttKeyOf(s) {
+  const c = Object.assign({}, s); delete c.viewDir; return JSON.stringify(c);
+}
+function normAz(a) { return ((Math.round(a) % 360) + 360) % 360; }
+
+function afterUserDraw(m) {
+  const s = settings();
+  const key = ttKeyOf(s);
+  const ae = azElOf(s.viewDir);
+  if (key !== TT.key || Math.abs(ae.el - TT.el) > 0.5) {
+    TT.cache.clear(); TT.key = key; TT.el = ae.el;
+  }
+  const az = normAz(ae.az);
+  if (TT_AZ.includes(az) && Math.abs(ae.az - Math.round(ae.az)) < 1e-6)
+    TT.cache.set(az, { svg: m.svg, counts: m.counts });
+  $('angles').hidden = false;
+  updateStrip(az);
+}
+
+function scheduleTurntable() {
+  clearTimeout(TT.timer);
+  TT.timer = setTimeout(renderNextAngle, 1200);
+}
+
+function renderNextAngle() {
+  if (!meshLoaded || running || dragging) return;
+  const next = TT_AZ.find(a => !TT.cache.has(a));
+  if (next === undefined) { setStatusSoft('all 8 angles ready'); return; }
+  const s = settings();
+  const e = TT.el * Math.PI / 180, a = next * Math.PI / 180;
+  s.viewDir = [Math.sin(a) * Math.cos(e), -Math.cos(a) * Math.cos(e), Math.sin(e)];
+  running = true;
+  setStatusSoft('pre-rendering ' + next + '° …');
+  worker.postMessage({ type: 'run', settings: s, tag: { bg: true, az: next } });
+}
+
+function setStatusSoft(t) {   // append to, not replace, the counts readout
+  const cur = $('status').textContent.split('  |  ')[0];
+  $('status').textContent = cur + '  |  ' + t;
+}
+
+// ---- spin: animated rotation ---------------------------------------------------
+// Two tiers, resource-gated. Light models (per-view under LIVE_MS): stream
+// real drawing frames continuously, 2°/frame, self-paced by the worker.
+// Heavier models: flip through the 8 cached turntable angles, zoetrope-style.
+const spin = { playing: false, mode: null, timer: null, idx: 0 };
+
+function toggleSpin() {
+  if (spin.playing) { stopSpin(true); return; }
+  const sel = $('view').value;
+  orbitFromView(sel === 'custom'
+    ? vec('viewX', 'viewY', 'viewZ') : sel.split(',').map(parseFloat));
+  if (workerMode === 'worker' && perViewMs !== null &&
+      perViewMs < LIVE_MS && lastSVG !== null) {
+    spin.playing = true; spin.mode = 'live';
+    orbit.az = (orbit.az + 2) % 360;
+    requestLiveFrame();
+  } else if (TT_AZ.every(a => TT.cache.has(a))) {
+    spin.playing = true; spin.mode = 'cache'; spin.idx = 0;
+    spin.timer = setInterval(() => {
+      const az = TT_AZ[spin.idx++ % TT_AZ.length];
+      const hit = TT.cache.get(az);
+      showDrawing(hit.svg, hit.counts, az + '° · spinning');
+      updateStrip(az);
+    }, 600);
+  } else {
+    setStatusSoft('spin unlocks when all 8 angles are cached — pre-rendering…');
+    clearTimeout(TT.timer);
+    TT.timer = setTimeout(renderNextAngle, 50);
+    return;
+  }
+  $('spinBtn').textContent = '■';
+}
+function stopSpin(commit) {
+  if (!spin.playing) return;
+  spin.playing = false;
+  clearInterval(spin.timer);
+  $('spinBtn').textContent = '▶';
+  if (commit && spin.mode === 'live') {
+    const v = viewFromOrbit();
+    $('view').value = 'custom'; $('customView').hidden = false;
+    $('viewX').value = v[0].toFixed(4);
+    $('viewY').value = v[1].toFixed(4);
+    $('viewZ').value = v[2].toFixed(4);
+    scheduleRun(0);
+  }
+  spin.mode = null;
+}
+
+function updateStrip(currentAz) {
+  const strip = $('angles');
+  if (!strip.childElementCount) {
+    const play = document.createElement('button');
+    play.id = 'spinBtn'; play.textContent = '▶';
+    play.title = 'spin the model';
+    play.addEventListener('click', toggleSpin);
+    strip.appendChild(play);
+    for (const a of TT_AZ) {
+      const b = document.createElement('button');
+      b.textContent = a + '°';
+      b.addEventListener('click', () => { stopSpin(false); openAngle(a); });
+      strip.appendChild(b);
+    }
+  }
+  [...strip.children].forEach((b, i) => {
+    if (b.id === 'spinBtn') return;
+    b.classList.toggle('ready', TT.cache.has(TT_AZ[i - 1]));
+    b.classList.toggle('current', TT_AZ[i - 1] === currentAz);
+  });
+}
+
+function openAngle(az) {
+  clearTimeout(TT.timer);
+  const e = TT.el * Math.PI / 180, a = az * Math.PI / 180;
+  const v = [Math.sin(a) * Math.cos(e), -Math.cos(a) * Math.cos(e), Math.sin(e)];
+  $('view').value = 'custom'; $('customView').hidden = false;
+  $('viewX').value = v[0].toFixed(4);
+  $('viewY').value = v[1].toFixed(4);
+  $('viewZ').value = v[2].toFixed(4);
+  const hit = TT.cache.get(az);
+  if (hit) {
+    showDrawing(hit.svg, hit.counts, az + '° · cached');
+    updateStrip(az);
+    scheduleTurntable();
+  } else {
+    updateStrip(az);
+    scheduleRun(0);
+  }
+}
+
+function drawOrbit() {
+  if (!preview) return;
+  const cv = $('orbit'), stage = $('stage');
+  cv.width = stage.clientWidth; cv.height = stage.clientHeight;
+  const ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  const css = getComputedStyle(document.body);
+
+  // Exactly the export camera: same basis, same frame, same margin box —
+  // so where the wireframe sits on this page is where the drawing lands.
+  const s = settings();
+  const [W, H] = s.pageMM, m = s.marginMM;
+  const view = viewFromOrbit();
+  const up = [0, 0, 1];
+  const fwd = [-view[0], -view[1], -view[2]];
+  let right = [fwd[1] * up[2] - fwd[2] * up[1],
+               fwd[2] * up[0] - fwd[0] * up[2],
+               fwd[0] * up[1] - fwd[1] * up[0]];
+  const rl = Math.hypot(...right) || 1;
+  right = [right[0] / rl, right[1] / rl, right[2] / rl];
+  const tup = [right[1] * fwd[2] - right[2] * fwd[1],
+               right[2] * fwd[0] - right[0] * fwd[2],
+               right[0] * fwd[1] - right[1] * fwd[0]];
+  const scaleF = preview.diag * s.orthoZoom;
+  const frameW = W >= H ? scaleF : scaleF * W / H;
+  const frameH = W >= H ? scaleF * H / W : scaleF;
+  const iw = W - 2 * m, ih = H - 2 * m;
+
+  // fit the page on the canvas like fitSheet does
+  const sc = Math.min((cv.width - 80) / W, (cv.height - 80) / H);
+  const ox = (cv.width - W * sc) / 2, oy = (cv.height - H * sc) / 2;
+
+  // the sheet + margin guide
+  ctx.fillStyle = css.getPropertyValue('--paper');
+  ctx.fillRect(ox, oy, W * sc, H * sc);
+  ctx.strokeStyle = css.getPropertyValue('--line');
+  ctx.strokeRect(ox, oy, W * sc, H * sc);
+  if (m > 0) {
+    ctx.setLineDash([4, 4]);
+    ctx.strokeRect(ox + m * sc, oy + m * sc, iw * sc, ih * sc);
+    ctx.setLineDash([]);
+  }
+
+  const c = preview.center;
+  const px = (wx, wy, wz) => {                 // world -> canvas, via page mm
+    const x = wx * right[0] + wy * right[1] + wz * right[2];
+    const y = wx * tup[0] + wy * tup[1] + wz * tup[2];
+    const mmx = m + (x / frameW + 0.5) * iw;
+    const mmy = m + (1.0 - (y / frameH + 0.5)) * ih;
+    return [ox + mmx * sc, oy + mmy * sc];
+  };
+
+  const E = preview.edges;
+  ctx.strokeStyle = css.getPropertyValue('--ink-soft');
+  ctx.lineWidth = 0.6;
+  ctx.beginPath();
+  for (let i = 0; i < E.length; i += 6) {
+    const a = px(E[i] - c[0], E[i + 1] - c[1], E[i + 2] - c[2]);
+    const b = px(E[i + 3] - c[0], E[i + 4] - c[1], E[i + 5] - c[2]);
+    ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]);
+  }
+  ctx.stroke();
+  // lamp marker: the cube-corner light, in the same projection
+  if ($('keySource').value === 'CUBE') {
+    const h = preview.size[2];
+    const cc = $('cubeCorner').value.split(',').map(parseFloat);
+    const [lpx, lpy] = px(cc[0] * h, cc[1] * h, cc[2] * h);
+    ctx.strokeStyle = css.getPropertyValue('--accent');
+    ctx.beginPath(); ctx.arc(lpx, lpy, 5, 0, 2 * Math.PI); ctx.stroke();
+    for (let r = 0; r < 8; r++) {
+      const t = r * Math.PI / 4;
+      ctx.beginPath();
+      ctx.moveTo(lpx + Math.cos(t) * 8, lpy + Math.sin(t) * 8);
+      ctx.lineTo(lpx + Math.cos(t) * 12, lpy + Math.sin(t) * 12);
+      ctx.stroke();
+    }
+  }
+  ctx.fillStyle = css.getPropertyValue('--ink-soft');
+  ctx.font = '11px ' + css.getPropertyValue('--mono');
+  ctx.fillText('az ' + orbit.az.toFixed(0) + '°   el ' + orbit.el.toFixed(0) + '°', 12, 18);
+}
+
+function requestLiveFrame() {
+  if (liveInFlight) { livePending = true; return; }
+  liveInFlight = true;
+  const s = settings();
+  s.viewDir = viewFromOrbit();
+  worker.postMessage({ type: 'run', settings: s, tag: { live: true } });
+}
+
+// ---- drag modes: rotate the view, or aim a slicing plane ----------------------
+// 'rotate' is the orbit. 'planeA'/'planeB' (World mode only) lock the model
+// and drag the plane NORMAL instead; a single center-plane contour — front
+// AND back, no hidden-line culling — draws live over the current drawing so
+// you aim the blade against the finished render. Release commits the normal
+// to the Plane A/B fields and redraws. Changing a plane costs the same as
+// any redraw: one slice pass with AO cached.
+let dragMode = 'rotate';
+const plane = { az: 0, el: 30 };
+let psInFlight = false, psPending = false, psSegs = null;
+
+function normalFromPlane() {
+  const a = plane.az * Math.PI / 180, e = plane.el * Math.PI / 180;
+  return [Math.sin(a) * Math.cos(e), -Math.cos(a) * Math.cos(e), Math.sin(e)];
+}
+function planeFields() {
+  return dragMode === 'planeA' ? ['nAX', 'nAY', 'nAZ']
+       : dragMode === 'planeB' ? ['nBX', 'nBY', 'nBZ']
+       : ['nCX', 'nCY', 'nCZ'];
+}
+
+function setDragMode(m) {
+  dragMode = m;
+  [...$('dragModes').children].forEach(b =>
+    b.classList.toggle('current', b.dataset.mode === m));
+  $('hint').textContent = m === 'rotate'
+    ? 'drag to rotate — redraws on release'
+    : 'drag to aim plane ' + m.slice(-1) + ' — redraws on release';
+}
+function updateDragModeUI() {
+  const world = $('mode').value === 'WORLD';
+  const useC = world && $('useC').checked;
+  for (const b of $('dragModes').children) {
+    if (b.dataset.mode === 'planeC') b.disabled = !useC;
+    else if (b.dataset.mode !== 'rotate') b.disabled = !world;
+  }
+  if ((!world && dragMode !== 'rotate') || (!useC && dragMode === 'planeC'))
+    setDragMode('rotate');
+}
+[...$('dragModes').children].forEach(b =>
+  b.addEventListener('click', () => setDragMode(b.dataset.mode)));
+
+function requestPlaneSlice() {
+  if (psInFlight) { psPending = true; return; }
+  psInFlight = true;
+  worker.postMessage({ type: 'planeslice', settings: settings(),
+                       normal: normalFromPlane(), tag: { ps: true } });
+}
+
+function sheetTransform(cv) {
+  // Map page-mm to overlay-canvas px, aligned with whatever is on screen:
+  // the live sheet's rect when visible, else the drawOrbit fit.
+  const s = settings();
+  const [W, H] = s.pageMM;
+  const svg = $('sheet').querySelector('svg');
+  if (svg && !$('sheet').hidden) {
+    const r = svg.getBoundingClientRect();
+    const sr = $('stage').getBoundingClientRect();
+    return { ox: r.left - sr.left, oy: r.top - sr.top, sc: r.width / W };
+  }
+  const sc = Math.min((cv.width - 80) / W, (cv.height - 80) / H);
+  return { ox: (cv.width - W * sc) / 2, oy: (cv.height - H * sc) / 2, sc };
+}
+
+function drawPlaneOverlay() {
+  const cv = $('orbit'), stage = $('stage');
+  cv.width = stage.clientWidth; cv.height = stage.clientHeight;
+  const ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  const css = getComputedStyle(document.body);
+  const { ox, oy, sc } = sheetTransform(cv);
+  if (psSegs) {
+    ctx.strokeStyle = css.getPropertyValue('--m');
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (let i = 0; i < psSegs.length; i += 4) {
+      ctx.moveTo(ox + psSegs[i] * sc,     oy + psSegs[i + 1] * sc);
+      ctx.lineTo(ox + psSegs[i + 2] * sc, oy + psSegs[i + 3] * sc);
+    }
+    ctx.stroke();
+  }
+  ctx.fillStyle = css.getPropertyValue('--m');
+  ctx.font = '11px ' + css.getPropertyValue('--mono');
+  ctx.fillText('plane ' + dragMode.slice(-1) +
+    '  az ' + plane.az.toFixed(0) + '°   el ' + plane.el.toFixed(0) + '°', 12, 18);
+}
+
+let dragging = false, lastX = 0, lastY = 0, rafPending = false;
+const stage = $('stage');
+stage.addEventListener('pointerdown', e => {
+  if (!preview || e.target.closest('#controls') || e.target.closest('#angles')
+      || e.target.closest('#dragModes')) return;
+  clearTimeout(TT.timer);
+  stopSpin(false);
+  dragging = true; lastX = e.clientX; lastY = e.clientY;
+  stage.classList.add('dragging');
+  stage.setPointerCapture(e.pointerId);
+  if (dragMode !== 'rotate') {
+    // seed the plane orbit from the current normal fields
+    const [fx, fy, fz] = planeFields();
+    const r = azElOf([parseFloat($(fx).value), parseFloat($(fy).value),
+                      parseFloat($(fz).value)]);
+    plane.az = r.az; plane.el = r.el;
+    psSegs = null;
+    if (!(liveMode = workerMode === 'worker' && perViewMs !== null &&
+          perViewMs < LIVE_MS && lastSVG !== null)) {
+      $('orbit').hidden = false;
+      requestPlaneSlice();
+      drawPlaneOverlay();
+    }
+    return;
+  }
+  // seed orbit from whatever view is current
+  const sel = $('view').value;
+  orbitFromView(sel === 'custom'
+    ? vec('viewX', 'viewY', 'viewZ') : sel.split(',').map(parseFloat));
+  liveMode = workerMode === 'worker' &&
+             perViewMs !== null && perViewMs < LIVE_MS && lastSVG !== null;
+  if (liveMode) return;                  // sheet stays up; frames stream in
+  $('sheet').hidden = true; $('empty').hidden = true;
+  $('orbit').hidden = false;
+  drawOrbit();
+});
+stage.addEventListener('pointermove', e => {
+  if (!dragging) return;
+  if (dragMode !== 'rotate') {
+    plane.az = (plane.az + (e.clientX - lastX) * 0.4) % 360;
+    plane.el = Math.max(-89, Math.min(89, plane.el + (e.clientY - lastY) * 0.4));
+    lastX = e.clientX; lastY = e.clientY;
+    const [fx, fy, fz] = planeFields();
+    const n = normalFromPlane();
+    $(fx).value = n[0].toFixed(4);
+    $(fy).value = n[1].toFixed(4);
+    $(fz).value = n[2].toFixed(4);
+    if (liveMode) requestLiveFrame();          // real drawing streams
+    else requestPlaneSlice();                  // contour proxy
+    return;
+  }
+  orbit.az = (orbit.az + (e.clientX - lastX) * 0.4) % 360;
+  orbit.el = Math.max(-89, Math.min(89, orbit.el + (e.clientY - lastY) * 0.4));
+  lastX = e.clientX; lastY = e.clientY;
+  if (liveMode) { requestLiveFrame(); return; }
+  if (!rafPending) {
+    rafPending = true;
+    requestAnimationFrame(() => { rafPending = false; drawOrbit(); });
+  }
+});
+stage.addEventListener('pointerup', e => {
+  if (!dragging) return;
+  dragging = false; livePending = false; psPending = false;
+  stage.classList.remove('dragging');
+  if (dragMode !== 'rotate') {
+    $('orbit').hidden = true;
+    scheduleRun(0);
+    return;
+  }
+  // commit the orbit into the panel as a custom view, then redraw for real.
+  const v = viewFromOrbit();
+  $('view').value = 'custom';
+  $('customView').hidden = false;
+  $('viewX').value = v[0].toFixed(4);
+  $('viewY').value = v[1].toFixed(4);
+  $('viewZ').value = v[2].toFixed(4);
+  $('orbit').hidden = true;
+  $('sheet').hidden = lastSVG === null;
+  scheduleRun(0);
+});
+
+function stampSVG(svg) {
+  // Quiet provenance: an XML comment, invisible in any render, no plotted
+  // ink. Injected only at export so the engine's output stays pristine.
+  return svg.replace('<svg',
+    '<!-- generated with Silverpoint Hatch \u00b7 uneditioned.com \u00b7 thebrianhart.com -->\n<svg');
+}
+
+// ---- chop: a plotted tag in the margin ----------------------------------------
+// Single-stroke glyphs (real polylines, so any plotter draws them) for the
+// characters of 'uneditioned.com'. Unit space: x-height 4, ascender 6,
+// y up; each glyph is [advance, [stroke, ...]].
+const CHOP_TEXT = 'uneditioned.com';
+const GLYPHS = {
+  'u': [4, [[[0,4],[0,1],[1,0],[2,0],[3,1]], [[3,4],[3,0]]]],
+  'n': [4, [[[0,0],[0,4]], [[0,3],[1,4],[2,4],[3,3],[3,0]]]],
+  'e': [4, [[[0,2],[3,2],[3,3],[2,4],[1,4],[0,3],[0,1],[1,0],[2,0],[3,0.6]]]],
+  'd': [4, [[[3,6],[3,0]], [[3,3],[2,4],[1,4],[0,3],[0,1],[1,0],[2,0],[3,1]]]],
+  'i': [2, [[[0.5,0],[0.5,4]], [[0.5,5.1],[0.5,5.5]]]],
+  't': [3, [[[1,6],[1,1],[2,0],[2.6,0.5]], [[0,4],[2.4,4]]]],
+  'o': [4, [[[0,1],[0,3],[1,4],[2,4],[3,3],[3,1],[2,0],[1,0],[0,1]]]],
+  '.': [2, [[[0.6,0],[0.6,0.4]]]],
+  'c': [4, [[[3,3.3],[2,4],[1,4],[0,3],[0,1],[1,0],[2,0],[3,0.7]]]],
+  'm': [4.5, [[[0,0],[0,4]], [[0,3],[0.9,4],[1.7,3],[1.7,0]],
+              [[1.7,3],[2.6,4],[3.5,3],[3.5,0]]]],
+};
+
+function chopLayer(pageMM, marginMM) {
+  const [W, H] = pageMM;
+  const pad = Math.max(marginMM, 4);
+  const S = 0.4;                                  // mm per unit: x-height 1.6mm
+  let width = 0;
+  for (const ch of CHOP_TEXT) width += (GLYPHS[ch] || [4])[0] * S;
+  let x = W - pad - width;                        // right end at drawable edge
+  const base = H - pad / 2 + 0.8;                 // centered in bottom margin
+  const paths = [];
+  for (const ch of CHOP_TEXT) {
+    const g = GLYPHS[ch];
+    if (!g) { x += 4 * S; continue; }
+    for (const stroke of g[1]) {
+      const d = stroke.map(([gx, gy], i) =>
+        (i ? 'L' : 'M') + (x + gx * S).toFixed(3) + ' ' + (base - gy * S).toFixed(3))
+        .join(' ');
+      paths.push('<path d="' + d + '"/>');
+    }
+    x += g[0] * S;
+  }
+  return '<g inkscape:groupmode="layer" inkscape:label="tag" fill="none" ' +
+    'stroke="#3a3a40" stroke-width="0.3" stroke-linecap="round">\n' +
+    paths.join('\n') + '\n</g>';
+}
+
+function withChop(svg) {
+  if (!$('chop').checked) return svg;
+  const s = settings();
+  return svg.replace('</svg>', chopLayer(s.pageMM, s.marginMM) + '\n</svg>');
+}
+
+// ---- chaining: join touching segments into polyline paths ---------------------
+// vpype-linemerge's job, done at export. Endpoints that should meet differ by
+// microns (floating-point evaluation order across neighbouring triangles), so
+// we join within CHAIN_TOL using a spatial grid. A join "bridges" a gap of at
+// most CHAIN_TOL — 1/20th of a 0.2mm pen width, invisible — and every original
+// segment is drawn exactly once. Genuinely separate ends (occlusion gaps,
+// dither dropouts) stay separate.
+const CHAIN_TOL = 0.01;                            // mm
+function chainSVG(svg, tol = CHAIN_TOL) {
+  let before = 0, after = 0;
+  const out = svg.replace(
+    /<g ([^>]*inkscape:label="[^"]*"[^>]*)>([\s\S]*?)<\/g>/g,
+    (whole, attrs, body) => {
+      const segs = [];
+      const re = /<line x1="([^"]+)" y1="([^"]+)" x2="([^"]+)" y2="([^"]+)"\/>/g;
+      let m;
+      while ((m = re.exec(body)) !== null)
+        segs.push([+m[1], +m[2], +m[3], +m[4]]);
+      if (!segs.length) return whole;              // not a line layer (e.g. tag)
+      before += segs.length;
+      const key = (x, y) => Math.round(x / tol) + ',' + Math.round(y / tol);
+      const grid = new Map();                       // cell -> [segIdx, end]
+      segs.forEach((s, i) => {
+        for (const e of [0, 1]) {
+          const k = key(s[e * 2], s[e * 2 + 1]);
+          if (!grid.has(k)) grid.set(k, []);
+          grid.get(k).push([i, e]);
+        }
+      });
+      const used = new Uint8Array(segs.length);
+      const take = (x, y) => {                      // nearest unused end <= tol
+        const gx = Math.round(x / tol), gy = Math.round(y / tol);
+        let best = null, bd = tol;
+        for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
+          for (const [i, e] of grid.get((gx + dx) + ',' + (gy + dy)) || []) {
+            if (used[i]) continue;
+            const d = Math.hypot(segs[i][e * 2] - x, segs[i][e * 2 + 1] - y);
+            if (d <= bd) { bd = d; best = [i, e]; }
+          }
+        }
+        if (!best) return null;
+        const [i, e] = best;
+        used[i] = 1;
+        return [segs[i][(1 - e) * 2], segs[i][(1 - e) * 2 + 1]];
+      };
+      const paths = [];
+      const fmt = (x, y) => x.toFixed(3) + ' ' + y.toFixed(3);
+      for (let i = 0; i < segs.length; i++) {
+        if (used[i]) continue;
+        used[i] = 1;
+        const chain = [[segs[i][0], segs[i][1]], [segs[i][2], segs[i][3]]];
+        let nxt;
+        while ((nxt = take(...chain[chain.length - 1])) !== null) chain.push(nxt);
+        while ((nxt = take(...chain[0])) !== null) chain.unshift(nxt);
+        paths.push('<path d="M' + chain.map(p => fmt(p[0], p[1])).join(' L') + '"/>');
+      }
+      after += paths.length;
+      return '<g ' + attrs + '>\n' + paths.join('\n') + '\n</g>';
+    });
+  return { svg: out, before, after };
+}
+
+function saveBlob(text, suffix) {
+  const blob = new Blob([text], { type: 'image/svg+xml' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'silverpoint_' + new Date().toISOString()
+    .replace(/[-:]/g, '').slice(0, 15) + suffix + '.svg';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+$('dlRaw').addEventListener('click', () => {
+  if (!lastSVG) return;
+  saveBlob(stampSVG(withChop(lastSVG)), '_raw');
+});
+$('dlChain').addEventListener('click', () => {
+  if (!lastSVG) return;
+  const t0 = Date.now();
+  const { svg, before, after } = chainSVG(lastSVG);
+  saveBlob(stampSVG(withChop(svg)), '_chained');
+  setStatusSoft('chained ' + before.toLocaleString() + ' segments \u2192 ' +
+    after.toLocaleString() + ' paths in ' + (Date.now() - t0) + 'ms');
+});
+</script>
+</body>
+</html>
